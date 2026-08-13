@@ -46,6 +46,9 @@ dependencies:
   flutter_map: ^8.3.1
   latlong2: ^0.9.1
   flutter_map_animations: ^0.10.0
+  # Flutter-team file picker; its Windows impl is native (no Dart win32
+  # dependency), so it doesn't clash with share_plus's win32 ^6 requirement.
+  file_selector: ^1.0.0
 
 dev_dependencies:
   flutter_test:
