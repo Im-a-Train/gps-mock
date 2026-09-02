@@ -49,7 +49,8 @@ class MapViewState extends State<MapView>
   double _rotation = 0;
   final DraggableScrollableController _sheetController =
       DraggableScrollableController();
-  double _sheetExtent = .34;
+  final ValueNotifier<double> _sheetExtent = ValueNotifier<double>(.34);
+  List<double>? _snapSizes;
   final NetworkTileProvider _tileProvider = NetworkTileProvider();
 
   @override
@@ -70,6 +71,7 @@ class MapViewState extends State<MapView>
     _searchController.dispose();
     _mapController.dispose();
     _sheetController.dispose();
+    _sheetExtent.dispose();
     super.dispose();
   }
 
@@ -749,109 +751,281 @@ class MapViewState extends State<MapView>
     );
   }
 
+  /// Height of the grab bar that stays on screen when the panel is collapsed.
+  static const double _sheetHandleHeight = 30;
+
+  /// Keys for the collapsible control panel, used by widget tests.
+  @visibleForTesting
+  static const Key sheetKey = Key('map-control-panel');
+  @visibleForTesting
+  static const Key sheetHandleKey = Key('map-control-panel-handle');
+
+  /// Snap targets are fractions of the panel's available height. The smallest
+  /// one leaves only the grab bar visible, which is what "hidden" means here —
+  /// swiping the panel away entirely would leave nothing to swipe back up.
+  double _collapsedExtent(double availableHeight, double defaultExtent) {
+    if (availableHeight <= 0) return math.min(.055, defaultExtent / 2);
+    final extent = (_sheetHandleHeight / availableHeight).clamp(.02, .2);
+    // Snap sizes must stay strictly ascending, even on a very short viewport.
+    return math.min(extent, defaultExtent / 2);
+  }
+
+  /// [DraggableScrollableSheet] compares [DraggableScrollableSheet.snapSizes]
+  /// by identity: handing it a fresh list on every build makes it re-run its
+  /// ballistic snap after each frame, which cancels an in-progress drag. Reuse
+  /// the same list while the values stay the same.
+  List<double> _snapSizesFor(double min, double mid, double max) {
+    final cached = _snapSizes;
+    if (cached != null &&
+        cached[0] == min &&
+        cached[1] == mid &&
+        cached[2] == max) {
+      return cached;
+    }
+    return _snapSizes = [min, mid, max];
+  }
+
+  void _animateSheetTo(double size) {
+    if (!_sheetController.isAttached) return;
+    _sheetController.animateTo(
+      size,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  /// Dragging the grab bar always resizes the panel, no matter where the
+  /// content underneath happens to be scrolled to.
+  void _onHandleDragUpdate(
+    DragUpdateDetails details,
+    double availableHeight,
+    double minExtent,
+    double maxExtent,
+  ) {
+    if (!_sheetController.isAttached || availableHeight <= 0) return;
+    final delta = (details.primaryDelta ?? 0) / availableHeight;
+    _sheetController.jumpTo(
+      (_sheetController.size - delta).clamp(minExtent, maxExtent),
+    );
+  }
+
+  void _onHandleDragEnd(
+    DragEndDetails details,
+    double minExtent,
+    double defaultExtent,
+    double maxExtent,
+  ) {
+    if (!_sheetController.isAttached) return;
+    const flingVelocity = 320.0;
+    const hardFlingVelocity = 1400.0;
+    final velocity = details.velocity.pixelsPerSecond.dy;
+    final size = _sheetController.size;
+
+    double target;
+    if (velocity > flingVelocity) {
+      // Swipe down: step down one stop, or straight to hidden on a hard fling.
+      target = (velocity > hardFlingVelocity || size <= defaultExtent + .01)
+          ? minExtent
+          : defaultExtent;
+    } else if (velocity < -flingVelocity) {
+      // Swipe up: step back up one stop.
+      target = (velocity < -hardFlingVelocity || size >= defaultExtent - .01)
+          ? maxExtent
+          : defaultExtent;
+    } else {
+      target = [minExtent, defaultExtent, maxExtent].reduce(
+        (a, b) => (size - a).abs() <= (size - b).abs() ? a : b,
+      );
+    }
+    _animateSheetTo(target);
+  }
+
+  void _toggleSheet(double minExtent, double defaultExtent) {
+    if (!_sheetController.isAttached) return;
+    _animateSheetTo(
+      _sheetController.size > minExtent + .02 ? minExtent : defaultExtent,
+    );
+  }
+
   Widget _buildBottomPanel(BuildContext context, AppState appState) {
     final showRoutePanel = appState.routeMode || appState.isNavigating;
     final defaultExtent = showRoutePanel ? .58 : .34;
-    const minExtent = .055;
     const maxExtent = .94;
-    return NotificationListener<DraggableScrollableNotification>(
-      onNotification: (notification) {
-        if ((_sheetExtent - notification.extent).abs() > .01) {
-          setState(() => _sheetExtent = notification.extent);
-        }
-        return false;
-      },
-      child: DraggableScrollableSheet(
-        controller: _sheetController,
-        initialChildSize: defaultExtent,
-        minChildSize: minExtent,
-        maxChildSize: maxExtent,
-        snap: true,
-        snapSizes: [minExtent, defaultExtent, maxExtent],
-        snapAnimationDuration: const Duration(milliseconds: 240),
-        builder: (context, scrollController) {
-          return Material(
-            elevation: 12,
-            color: Theme.of(context).colorScheme.surface,
-            clipBehavior: Clip.antiAlias,
-            shape: const RoundedRectangleBorder(
-              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-            ),
-            child: CustomScrollView(
-              controller: scrollController,
-              physics: const ClampingScrollPhysics(),
-              slivers: [
-                SliverToBoxAdapter(
-                  child: Center(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 10),
-                      child: Container(
-                        width: 40,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .onSurfaceVariant
-                              .withValues(alpha: .4),
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      ),
-                    ),
-                  ),
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availableHeight = constraints.maxHeight;
+        final minExtent = _collapsedExtent(availableHeight, defaultExtent);
+        return NotificationListener<DraggableScrollableNotification>(
+          onNotification: (notification) {
+            // Only the panel content listens to this, so the map is not
+            // rebuilt on every frame of the drag.
+            _sheetExtent.value = notification.extent;
+            return false;
+          },
+          child: DraggableScrollableSheet(
+            controller: _sheetController,
+            initialChildSize: defaultExtent,
+            minChildSize: minExtent,
+            maxChildSize: maxExtent,
+            snap: true,
+            snapSizes: _snapSizesFor(minExtent, defaultExtent, maxExtent),
+            snapAnimationDuration: const Duration(milliseconds: 240),
+            builder: (context, scrollController) {
+              return Material(
+                key: sheetKey,
+                elevation: 12,
+                color: Theme.of(context).colorScheme.surface,
+                clipBehavior: Clip.antiAlias,
+                shape: const RoundedRectangleBorder(
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
                 ),
-                if (_sheetExtent > minExtent + .025)
-                  SliverPadding(
-                    padding: const EdgeInsets.fromLTRB(16, 2, 16, 12),
-                    sliver: SliverToBoxAdapter(
-                      child: SafeArea(
-                        top: false,
-                        child: Column(
-                          children: [
-                            Row(
-                              children: [
-                                if (appState.isNavigating)
-                                  _buildFollowButton(context),
-                                const Spacer(),
-                                _MapButton(
-                                  tooltip: "Go to my real location",
-                                  onPressed: () => _goToMyLocation(context),
-                                  child: const Icon(Icons.my_location),
+                child: Column(
+                  children: [
+                    _buildSheetHandle(
+                      context,
+                      availableHeight: availableHeight,
+                      minExtent: minExtent,
+                      defaultExtent: defaultExtent,
+                      maxExtent: maxExtent,
+                    ),
+                    Expanded(
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: _sheetExtent,
+                        builder: (context, extent, _) {
+                          final collapsed = extent <= minExtent + .01;
+                          return CustomScrollView(
+                            controller: scrollController,
+                            physics: const ClampingScrollPhysics(),
+                            slivers: [
+                              if (!collapsed)
+                                SliverPadding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    16,
+                                    2,
+                                    16,
+                                    12,
+                                  ),
+                                  sliver: SliverToBoxAdapter(
+                                    child: SafeArea(
+                                      top: false,
+                                      child: Column(
+                                        children: [
+                                          Row(
+                                            children: [
+                                              if (appState.isNavigating)
+                                                _buildFollowButton(context),
+                                              const Spacer(),
+                                              _MapButton(
+                                                tooltip:
+                                                    "Go to my real location",
+                                                onPressed: () =>
+                                                    _goToMyLocation(context),
+                                                child: const Icon(
+                                                  Icons.my_location,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                          const SizedBox(height: 8),
+                                          M3SegmentedControl<bool>(
+                                            options: const [
+                                              M3Segment(
+                                                value: false,
+                                                label: "Fixed",
+                                                icon: Icons.location_on,
+                                              ),
+                                              M3Segment(
+                                                value: true,
+                                                label: "Route",
+                                                icon: Icons.route,
+                                              ),
+                                            ],
+                                            selected: showRoutePanel,
+                                            onSelected: appState.isNavigating
+                                                ? null
+                                                : appState.setRouteMode,
+                                          ),
+                                          const SizedBox(height: 12),
+                                          if (showRoutePanel)
+                                            const RoutePanel()
+                                          else
+                                            _buildFixedControls(
+                                              context,
+                                              appState,
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
                                 ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            M3SegmentedControl<bool>(
-                              options: const [
-                                M3Segment(
-                                  value: false,
-                                  label: "Fixed",
-                                  icon: Icons.location_on,
-                                ),
-                                M3Segment(
-                                  value: true,
-                                  label: "Route",
-                                  icon: Icons.route,
-                                ),
-                              ],
-                              selected: showRoutePanel,
-                              onSelected: appState.isNavigating
-                                  ? null
-                                  : appState.setRouteMode,
-                            ),
-                            const SizedBox(height: 12),
-                            if (showRoutePanel)
-                              const RoutePanel()
-                            else
-                              _buildFixedControls(context, appState),
-                          ],
-                        ),
+                            ],
+                          );
+                        },
                       ),
                     ),
-                  ),
-              ],
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSheetHandle(
+    BuildContext context, {
+    required double availableHeight,
+    required double minExtent,
+    required double defaultExtent,
+    required double maxExtent,
+  }) {
+    return ValueListenableBuilder<double>(
+      valueListenable: _sheetExtent,
+      builder: (context, extent, child) {
+        final collapsed = extent <= minExtent + .02;
+        return Semantics(
+          button: true,
+          label: collapsed ? "Show controls" : "Hide controls",
+          hint: "Swipe up or down to resize the panel",
+          onTap: () => _toggleSheet(minExtent, defaultExtent),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            excludeFromSemantics: true,
+            onTap: () => _toggleSheet(minExtent, defaultExtent),
+            onVerticalDragUpdate: (details) => _onHandleDragUpdate(
+              details,
+              availableHeight,
+              minExtent,
+              maxExtent,
             ),
-          );
-        },
+            onVerticalDragEnd: (details) => _onHandleDragEnd(
+              details,
+              minExtent,
+              defaultExtent,
+              maxExtent,
+            ),
+            child: child,
+          ),
+        );
+      },
+      child: SizedBox(
+        key: sheetHandleKey,
+        height: _sheetHandleHeight,
+        width: double.infinity,
+        child: Center(
+          child: Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Theme.of(
+                context,
+              ).colorScheme.onSurfaceVariant.withValues(alpha: .4),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        ),
       ),
     );
   }
